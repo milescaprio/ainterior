@@ -1,0 +1,27 @@
+name: ainterior
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy
+  - pandas
+  - seaborn
+  - matplotlib
+  - ipython
+  - pip
+  - ipykernel
+  - diffusers 
+  - transformers
+  - pytorch
+  - requests
+  - streamlit
+  # - ultralytics-thop
+  - ultralytics
+  - nltk
+  - pillow
+  - pip:
+    - black[jupyter]
+    - black
+    - jupyterlab_code_formatter
+    - accelerate
