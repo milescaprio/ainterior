@@ -4,32 +4,31 @@ import io
 import json
 import requests
 import os
+import time  # For polling Replicate API
+import base64  # For encoding images for API
+import gc  # For garbage collection
 
-# Suppress warnings from diffusers/transformers for cleaner output
-os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = (
-    "1"  # Enable MPS fallback for Apple Silicon if GPU memory is low
-)
+# Suppress warnings from diffusers/transformers for cleaner output (though not loaded locally anymore)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Suppress tokenizers warning
-
-# --- Model Imports (Conditional to prevent immediate download for imports) ---
-# We'll load these only when needed to save memory and time if not used
-# and to manage dependencies better.
-# For local development, uncomment these and manage model downloads carefully.
-from ultralytics import YOLO
-from diffusers import (
-    StableDiffusionControlNetPipeline,
-    ControlNetModel,
-    UniPCMultistepScheduler,
-    EulerAncestralDiscreteScheduler,
-)
-from transformers import pipeline
-import torch
 
 # --- Configuration ---
 # Your Gemini API Key (replace with your actual key)
-from keys import GEMINI_API_KEY  # Ensure you have a keys.py file with your API key
+from keys import GEMINI_API_KEY
 
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+
+# Your Replicate API Token (replace with your actual token)
+from keys import REPLICATE_API_TOKEN
+
+REPLICATE_PREDICTION_API_URL = "https://api.replicate.com/v1/predictions"
+
+# Image generation resolution for the ControlNet API (e.g., 512x512, 768x768).
+# Lower resolution means less memory usage and faster generation, but lower quality.
+GENERATION_RESOLUTION = (
+    512,
+    512,
+)  # Recommended for local development/testing on M3 Mac
+
 
 # --- Mock Product Database ---
 # A simplified database for product linking. In a real app, this would query
@@ -129,12 +128,12 @@ MOCK_PRODUCT_DATABASE = {
 }
 
 
-# --- Model Loading (Cached for performance) ---
+# --- Model Loading (Only YOLOv8 runs locally now) ---
 @st.cache_resource
 def load_yolo_model():
     """Loads the YOLOv8 object detection model."""
     try:
-        # from ultralytics import YOLO
+        from ultralytics import YOLO
 
         model = YOLO("yolov8n.pt")  # yolov8n is the nano model, good for local/CPU
         st.success("YOLOv8 model loaded successfully.")
@@ -146,54 +145,70 @@ def load_yolo_model():
         st.stop()
 
 
-@st.cache_resource
-def load_diffusion_models():
-    """Loads Stable Diffusion and ControlNet models."""
-    try:
-        # from diffusers import (
-        #     StableDiffusionControlNetPipeline,
-        #     ControlNetModel,
-        #     UniPCMultistepScheduler,
-        # )
-        # from transformers import pipeline
-        # import torch
-
-        # Load ControlNet model (trained on segmentation maps)
-        controlnet = ControlNetModel.from_pretrained(
-            "lllyasviel/control_v11p_sd15_seg", torch_dtype=torch.float16
-        )
-
-        # Load Stable Diffusion pipeline with ControlNet
-        pipe = StableDiffusionControlNetPipeline.from_pretrained(
-            "runwayml/stable-diffusion-v1-5",
-            controlnet=controlnet,
-            torch_dtype=torch.float16,
-        )
-        pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(
-            pipe.scheduler.config
-        )
-
-        # Optimize for Apple Silicon (MPS) if available
-        if torch.backends.mps.is_available():
-            pipe.to("mps")
-            st.success(
-                "Stable Diffusion and ControlNet loaded successfully on MPS (Apple Silicon)."
-            )
-        elif torch.cuda.is_available():
-            pipe.to("cuda")
-            st.success("Stable Diffusion and ControlNet loaded on Windows (CUDA).")
-        else:
-            pipe.to("cpu")  # Fallback to CPU
-            st.warning(
-                "MPS (Apple Silicon GPU) or CUDA not available. Models loading on CPU, which will be significantly slower."
-            )
-
-        return pipe
-    except Exception as e:
+# --- Replicate API Helper ---
+def call_replicate_controlnet_api(payload):
+    """
+    Calls the Replicate API for ControlNet and polls for the result.
+    """
+    if REPLICATE_API_TOKEN == "YOUR_REPLICATE_API_TOKEN":
         st.error(
-            f"Failed to load Stable Diffusion/ControlNet models: {e}. Please ensure `diffusers`, `transformers`, `torch` are installed and a stable internet connection for initial download."
+            "Please provide your Replicate API token in the `REPLICATE_API_TOKEN` variable in the script."
         )
         st.stop()
+
+    headers = {
+        "Authorization": f"Token {REPLICATE_API_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        # 1. Start the prediction
+        response = requests.post(
+            REPLICATE_PREDICTION_API_URL, headers=headers, data=json.dumps(payload)
+        )
+        response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+        prediction_data = response.json()
+        prediction_id = prediction_data.get("id")
+        status_url = prediction_data.get("urls", {}).get("get")
+
+        if not prediction_id or not status_url:
+            st.error(
+                f"Failed to start Replicate prediction: {prediction_data.get('detail', 'No prediction ID or status URL found.')}"
+            )
+            return None
+
+        # 2. Poll for the result
+        while prediction_data.get("status") not in ["succeeded", "failed", "canceled"]:
+            time.sleep(2)  # Wait for 2 seconds before polling again
+            poll_response = requests.get(status_url, headers=headers)
+            poll_response.raise_for_status()
+            prediction_data = poll_response.json()
+            st.info(f"Replicate prediction status: {prediction_data.get('status')}...")
+
+        if prediction_data.get("status") == "succeeded":
+            output_url = prediction_data.get("output")
+            if output_url and isinstance(output_url, list) and len(output_url) > 0:
+                return output_url[0]  # Replicate often returns a list of URLs
+            else:
+                st.error(
+                    f"Replicate prediction succeeded but no output URL found: {prediction_data}"
+                )
+                return None
+        else:
+            st.error(
+                f"Replicate prediction failed or was canceled: {prediction_data.get('error', prediction_data.get('status'))}"
+            )
+            return None
+
+    except requests.exceptions.RequestException as e:
+        st.error(f"Network or API error communicating with Replicate: {e}")
+        return None
+    except json.JSONDecodeError as e:
+        st.error(f"Error decoding JSON response from Replicate: {e}")
+        return None
+    except Exception as e:
+        st.error(f"An unexpected error occurred during Replicate API call: {e}")
+        return None
 
 
 # --- AI Logic Functions ---
@@ -511,14 +526,13 @@ def generate_layout_and_products(prompt, iteration_count=0):
             return None
 
 
-def generate_images_with_controlnet(original_wall_images, proposed_layout):
+def generate_images_with_controlnet(original_wall_images, proposed_layout, user_prefs):
     """
-    Stage 4: Image Generation (Text-to-Image with ControlNet)
+    Stage 4: Image Generation (Text-to-Image with ControlNet via Replicate API)
     Generates new images based on the proposed layout and original images.
     Uses a simplified ControlNet conditioning (drawing rectangles on a blank map)
-    for new objects.
+    for new objects and sends it to Replicate.
     """
-    pipe = load_diffusion_models()
     generated_images_data = {}
 
     st.subheader("🎨 Generating AI Design Images...")
@@ -535,24 +549,17 @@ def generate_images_with_controlnet(original_wall_images, proposed_layout):
         original_image = original_wall_images[
             wall_id
         ].copy()  # Get the PIL Image object
-        width, height = original_image.size
+
+        # Resize original image to the target generation resolution for consistency
+        original_image = original_image.resize(GENERATION_RESOLUTION)
+        width, height = GENERATION_RESOLUTION
 
         # Create a blank control image (segmentation map proxy)
         control_image = Image.new(
             "RGB", (width, height), color=(0, 0, 0)
         )  # Black background
         draw = ImageDraw.Draw(control_image)
-        # Use a simple font for drawing on control image (if text needed)
-        try:
-            font = ImageFont.truetype(
-                "arial.ttf", 20
-            )  # This might fail if font not found
-        except IOError:
-            font = ImageFont.load_default()  # Fallback to default
 
-        # Draw proposed items as simple rectangles/shapes on the control_image
-        # This is a simplification of true semantic segmentation for ControlNet
-        # The quality of output highly depends on how well ControlNet interprets these simple shapes.
         object_colors = {
             "bed": (255, 0, 0),
             "sofa": (0, 255, 0),
@@ -564,136 +571,172 @@ def generate_images_with_controlnet(original_wall_images, proposed_layout):
             "rug": (128, 255, 0),
             "plant": (0, 128, 255),
             "bookshelf": (128, 0, 255),
-            "table": (255, 0, 128),  # Add more colors for other object types
+            "table": (255, 0, 128),
         }
 
+        # Draw proposed items as simple rectangles/shapes on the control_image
         for item in wall_config["items"]:
             item_type = item["type"].lower().replace(" ", "_")
             pos = item["approx_position"].lower()
             color = object_colors.get(item_type, (128, 128, 128))  # Default grey
 
-            # Very basic approximation of object placement based on text position
-            # This is heuristic and will require tuning/more sophisticated logic for real use
-            x_center, y_center = width // 2, height // 2
-            item_width, item_height = (
-                width // 4,
-                height // 4,
-            )  # Default size for new objects
+            # Basic approximation of object placement based on text position
+            # These are heuristics and may need fine-tuning for better visual results
+            x1, y1, x2, y2 = 0, 0, width, height  # Default full image
 
-            # More refined placement logic based on common interior design item positions
+            # Common object sizes and positions relative to GENERATION_RESOLUTION
             if "bed" in item_type:
-                item_width, item_height = int(width * 0.7), int(height * 0.4)
-                x1, y1 = (
-                    width - item_width
-                ) // 2, height - item_height - 20  # bottom center
+                item_w, item_h = int(width * 0.7), int(height * 0.4)
+                x1 = (width - item_w) // 2
+                y1 = (
+                    height - item_h - int(height * 0.05)
+                )  # bottom center, slightly up from floor
             elif "sofa" in item_type:
-                item_width, item_height = int(width * 0.7), int(height * 0.3)
-                x1, y1 = (
-                    width - item_width
-                ) // 2, height - item_height - 20  # bottom center
+                item_w, item_h = int(width * 0.7), int(height * 0.35)
+                x1 = (width - item_w) // 2
+                y1 = height - item_h - int(height * 0.05)
             elif "nightstand" in item_type:
-                item_width, item_height = int(width * 0.15), int(height * 0.25)
-                if "left_of_bed" in pos or "left" in pos:
-                    x1 = int(width * 0.1)  # Arbitrary left side
-                elif "right_of_bed" in pos or "right" in pos:
-                    x1 = int(width * 0.75)  # Arbitrary right side
-                else:  # Default to one side if not specified
-                    x1 = int(width * 0.1)
-                y1 = height - item_height - 20
-            elif "art_piece" in item_type:
-                item_width, item_height = int(width * 0.4), int(height * 0.3)
-                if "above_sofa" in pos or "above_bed" in pos:
-                    x1 = (width - item_width) // 2
-                    y1 = int(height * 0.2)  # Higher up
-                else:
-                    x1 = (width - item_width) // 2
-                    y1 = int(height * 0.3)
-            elif "desk" in item_type:
-                item_width, item_height = int(width * 0.5), int(height * 0.35)
-                x1, y1 = (width - item_width) // 2, height - item_height - 20
-            elif "chair" in item_type:
-                item_width, item_height = int(width * 0.25), int(height * 0.4)
-                if "corner" in pos:
-                    x1 = int(width * 0.1) if "left" in pos else int(width * 0.65)
-                else:
-                    x1 = (width - item_width) // 2
-                y1 = height - item_height - 20
-            elif "lamp" in item_type:
-                item_width, item_height = int(width * 0.1), int(height * 0.5)
-                if "corner" in pos or "side" in pos:
-                    x1 = int(width * 0.05) if "left" in pos else int(width * 0.85)
-                else:  # Default to one side
+                item_w, item_h = int(width * 0.18), int(height * 0.28)
+                if "left" in pos:
                     x1 = int(width * 0.05)
-                y1 = height - item_height - 20
-            elif "rug" in item_type:
-                item_width, item_height = int(width * 0.8), int(height * 0.6)
-                x1, y1 = (
-                    width - item_width
-                ) // 2, height - item_height + 50  # on the floor
-            elif "plant" in item_type:
-                item_width, item_height = int(width * 0.1), int(height * 0.3)
-                if "corner" in pos:
-                    x1 = int(width * 0.05) if "left" in pos else int(width * 0.85)
+                elif "right" in pos:
+                    x1 = int(width * 0.77)
                 else:
-                    x1 = x_center - item_width // 2
-                y1 = height - item_height - 20
+                    x1 = (width - item_w) // 2  # Default center
+                y1 = height - item_h - int(height * 0.05)
+            elif "art_piece" in item_type:
+                item_w, item_h = int(width * 0.4), int(height * 0.3)
+                x1 = (width - item_w) // 2
+                y1 = int(height * 0.2)  # Upper half for wall art
+            elif "desk" in item_type:
+                item_w, item_h = int(width * 0.6), int(height * 0.35)
+                x1 = (width - item_w) // 2
+                y1 = height - item_h - int(height * 0.05)
+            elif "chair" in item_type:
+                item_w, item_h = int(width * 0.25), int(height * 0.4)
+                x1 = (width - item_w) // 2
+                y1 = height - item_h - int(height * 0.05)
+            elif "lamp" in item_type:
+                item_w, item_h = int(width * 0.1), int(height * 0.5)
+                if "left" in pos:
+                    x1 = int(width * 0.05)
+                elif "right" in pos:
+                    x1 = int(width * 0.85)
+                else:
+                    x1 = int(width * 0.45)  # Default close to center
+                y1 = height - item_h - int(height * 0.05)
+            elif "rug" in item_type:
+                item_w, item_h = int(width * 0.8), int(height * 0.6)
+                x1, y1 = (width - item_w) // 2, height - item_h + int(
+                    height * 0.1
+                )  # On the floor
+            elif "plant" in item_type:
+                item_w, item_h = int(width * 0.12), int(height * 0.35)
+                if "left" in pos:
+                    x1 = int(width * 0.02)
+                elif "right" in pos:
+                    x1 = int(width * 0.86)
+                else:
+                    x1 = (width - item_w) // 2
+                y1 = height - item_h - int(height * 0.02)
             elif "bookshelf" in item_type:
-                item_width, item_height = int(width * 0.4), int(height * 0.6)
-                x1 = (
-                    int(width * 0.1) if "left" in pos else int(width * 0.5)
-                )  # Example for side placement
-                y1 = height - item_height - 20
+                item_w, item_h = int(width * 0.3), int(height * 0.6)
+                if "left" in pos:
+                    x1 = int(width * 0.05)
+                elif "right" in pos:
+                    x1 = int(width * 0.65)
+                else:
+                    x1 = int(width * 0.35)  # Default somewhere on the side
+                y1 = height - item_h - int(height * 0.05)
             elif "table" in item_type:
-                item_width, item_height = int(width * 0.4), int(height * 0.3)
-                x1, y1 = (width - item_width) // 2, height - item_height - 20
-            else:  # Generic object placement
-                item_width, item_height = int(width * 0.3), int(height * 0.3)
-                x1, y1 = (width - item_width) // 2, (
-                    height - item_height
-                ) // 2  # Center
+                item_w, item_h = int(width * 0.5), int(height * 0.3)
+                x1, y1 = (width - item_w) // 2, height - item_h - int(height * 0.05)
+            else:  # Fallback for generic/unrecognized items
+                item_w, item_h = int(width * 0.3), int(height * 0.3)
+                x1, y1 = (width - item_w) // 2, (height - item_h) // 2
 
-            x2, y2 = x1 + item_width, y1 + item_height
+            x2, y2 = x1 + item_w, y1 + item_h
             draw.rectangle([x1, y1, x2, y2], fill=color)
 
+        # Convert images to base64
+        buffered = io.BytesIO()
+        original_image.save(buffered, format="PNG")
+        original_image_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        original_image_data_uri = f"data:image/png;base64,{original_image_b64}"
+
+        buffered = io.BytesIO()
+        control_image.save(buffered, format="PNG")
+        control_image_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        control_image_data_uri = f"data:image/png;base64,{control_image_b64}"
+
         # Main prompt for ControlNet
-        prompt_text = f"Photorealistic interior design, {proposed_layout['proposed_layout_description']}, {user_prefs['desired_style']} style, {user_prefs['color_palette']} color palette, {user_prefs['material_preferences']} materials, high detail."
-        negative_prompt = "lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, noisy"
+        prompt_text = f"Photorealistic interior design, {proposed_layout['proposed_layout_description']}, {user_prefs['desired_style']} style, {user_prefs['color_palette']} color palette, {user_prefs['material_preferences']} materials, high detail, masterpiece."
+        negative_prompt = "lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, noisy, deformed, ugly, disfigured"
 
-        with st.spinner(f"Generating image for {wall_id} using ControlNet..."):
+        # Replicate API payload for ControlNet (using the 'seg' type)
+        # You can find the model ID for ControlNet-seg here:
+        # e.g., "lllyasviel/controlnet-v1-1-sd-v1-5-seg" or "jagilley/controlnet" and specify model_type="seg"
+        # The 'jagilley/controlnet' model is a general one that allows selecting model_type
+        # For simplicity, let's use 'jagilley/controlnet' and pass the 'seg' model_type
+        # Source: https://replicate.com/jagilley/controlnet
+        replicate_payload = {
+            "version": "jagilley/controlnet:a378a577c223c23e85e5d3155779c1628c65074b1bc532e2c2fafa66a3a41768",  # Specific ControlNet-seg version
+            "input": {
+                "image": control_image_data_uri,
+                "prompt": prompt_text,
+                "model_type": "seg",  # Specify segmentation control
+                "num_outputs": 1,
+                "guidance_scale": 7.5,
+                "num_inference_steps": 25,  # Balance quality and speed
+                "resolution": GENERATION_RESOLUTION[
+                    0
+                ],  # Replicate expects single int for square
+                "negative_prompt": negative_prompt,
+                "detect_resolution": GENERATION_RESOLUTION[
+                    0
+                ],  # Resolution for preprocessor
+                "image_resolution": GENERATION_RESOLUTION[0],  # Output image resolution
+            },
+        }
+
+        with st.spinner(
+            f"Sending request for {wall_id} to Replicate API and waiting for image generation..."
+        ):
             try:
-                # Generate image
-                control_tensor = (
-                    pipe.image_processor.preprocess(control_image)[0]
-                    .unsqueeze(0)
-                    .to(pipe.device)
-                )
-                pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(
-                    pipe.scheduler.config
-                )
-                generated_image = pipe(
-                    prompt_text,
-                    image=control_tensor,  # ControlNet uses this as conditioning
-                    num_inference_steps=20,  # Reduced steps for faster generation, can increase for quality
-                    guidance_scale=7.5,  # Often a good default
-                    negative_prompt=(
-                        "lowres, bad anatomy, bad hands, text, error, missing fingers, "
-                        "extra digit, fewer digits, cropped, worst quality, low quality, "
-                        "normal quality, jpeg artifacts, signature, watermark, username, blurry, noisy"
-                    ),
-                    # generator=torch.Generator("cpu").manual_seed(0) # For reproducibility
-                ).images[0]
+                output_image_url = call_replicate_controlnet_api(replicate_payload)
 
-                generated_images_data[wall_id] = {
-                    "image": generated_image,
-                    "items": wall_config["items"],
-                }
+                if output_image_url:
+                    # Download the generated image from the URL
+                    image_response = requests.get(output_image_url)
+                    image_response.raise_for_status()
+                    generated_pil_image = Image.open(
+                        io.BytesIO(image_response.content)
+                    ).convert("RGB")
+
+                    generated_images_data[wall_id] = {
+                        "image": generated_pil_image,
+                        "items": wall_config["items"],
+                    }
+                else:
+                    st.error(
+                        f"Replicate API did not return an image URL for {wall_id}."
+                    )
+                    generated_images_data[wall_id] = {
+                        "image": original_image,  # Fallback to original image
+                        "items": wall_config["items"],
+                    }
             except Exception as e:
-                st.error(f"Error generating image for {wall_id} with ControlNet: {e}")
-                # Fallback to original image if generation fails
+                st.error(
+                    f"Error generating image for {wall_id} with ControlNet via Replicate: {e}. Please check your API token, network, and Replicate logs."
+                )
                 generated_images_data[wall_id] = {
-                    "image": original_image,
+                    "image": original_image,  # Fallback to original image
                     "items": wall_config["items"],
                 }
+
+        # Explicitly clear memory after each image generation attempt
+        gc.collect()
+
     return generated_images_data
 
 
@@ -709,30 +752,33 @@ def overlay_labels_and_display(generated_images_data):
         items = data["items"]
 
         draw = ImageDraw.Draw(image)
+
+        # Adjust font size based on image height for better readability
+        # Assuming 512px height, font size 20-24 is good. Scale accordingly.
+        font_size = max(14, int(image.height / 25))  # Min 14, scales up
         try:
-            # Adjust font size for better visibility on images
-            font = ImageFont.truetype("arial.ttf", 24)
+            font = ImageFont.truetype("arial.ttf", font_size)
         except IOError:
             font = ImageFont.load_default()
 
-        # Simple logic to place labels. This will need more refinement for robust placement.
-        # For this simplified implementation, we don't have exact pixel coordinates of new objects.
-        # We'll just place labels based on general areas or infer from item type/position.
-        label_offset_y = 30
-        for i, item in enumerate(items):
-            label_text = f"{item['type']}"
-            if item.get("product_suggestion"):
-                label_text += f"\n- {item['product_suggestion']['name']} ({item['product_suggestion']['store']})"
+        label_offset_y = font_size + 10  # Spacing between labels
+        current_y_pos = 20  # Starting Y position for labels
 
-            # Placeholder for label position. In a real app, this would be based on generated object bbox.
-            # Here, we'll just stack them or place them in a corner.
-            text_x = 20
-            text_y = 20 + i * label_offset_y * 2  # Place labels vertically
+        for item in items:
+            product_info = item.get("product_suggestion", {})
 
-            # Add a background rectangle for better readability
-            # textbbox calculates the bounding box of the text
+            label_text = item["type"]
+            if (
+                product_info.get("name")
+                and product_info["name"] != f"Generic {item['type']}"
+            ):  # Don't show "Generic" in the label if it's explicitly generic
+                label_text += f"\n- {product_info['name']}"
+            if product_info.get("store") and product_info["store"] != "Generic":
+                label_text += f" ({product_info['store']})"
+
+            # Calculate text bounding box to draw background rectangle
             try:
-                text_bbox = draw.textbbox((text_x, text_y), label_text, font=font)
+                text_bbox = draw.textbbox((20, current_y_pos), label_text, font=font)
                 padding = 5
                 draw.rectangle(
                     (
@@ -743,7 +789,10 @@ def overlay_labels_and_display(generated_images_data):
                     ),
                     fill=(0, 0, 0, 150),  # Semi-transparent black
                 )
-                draw.text((text_x, text_y), label_text, font=font, fill=(255, 255, 255))
+                draw.text(
+                    (20, current_y_pos), label_text, font=font, fill=(255, 255, 255)
+                )
+                current_y_pos += (text_bbox[3] - text_bbox[1]) + label_offset_y
             except Exception as e:
                 st.warning(f"Could not draw text label for item '{item['type']}': {e}")
 
@@ -753,9 +802,17 @@ def overlay_labels_and_display(generated_images_data):
         st.markdown(f"**Items for {wall_id}:**")
         for item in items:
             product_info = item.get("product_suggestion", {})
-            st.markdown(
-                f"- **{item['type']}** ({item['style']}): {product_info.get('name', 'N/A')} from {product_info.get('store', 'N/A')}"
-            )
+            display_name = product_info.get("name", "N/A")
+            display_store = product_info.get("store", "N/A")
+
+            # Improve display if product is generic
+            if display_name == f"Generic {item['type']}" and display_store == "Generic":
+                st.markdown(f"- **{item['type']}** ({item['style']}): Generic Item")
+            else:
+                st.markdown(
+                    f"- **{item['type']}** ({item['style']}): {display_name} from {display_store}"
+                )
+
             if product_info.get("mock_url") and product_info["mock_url"] != "N/A":
                 st.markdown(f"  [View Product (Mock)]({product_info['mock_url']})")
         st.markdown("---")
@@ -782,6 +839,10 @@ if "uploaded_file_objects" not in st.session_state:
     st.session_state.uploaded_file_objects = {}
 
 if uploaded_files:
+    # Clear previous uploads if new files are added
+    if len(uploaded_files) != len(st.session_state.uploaded_file_objects):
+        st.session_state.uploaded_file_objects = {}  # Clear if number of files changed
+
     for i, uploaded_file in enumerate(uploaded_files):
         # FIX: Standardize wall_id to lowercase for consistency with LLM's common output patterns
         wall_id = f"wall_{chr(97 + i)}"  # Generates "wall_a", "wall_b", etc.
@@ -892,11 +953,10 @@ if st.button("Generate Design Suggestions", type="primary"):
                 if st.session_state.current_layout_data:
                     # Stage 4 & 5: Image Generation and Labeling
                     # Now, original_wall_images (room_analysis_data["wall_images"]) holds PIL Image objects
-                    st.session_state.generated_images_data = (
-                        generate_images_with_controlnet(
-                            st.session_state.room_analysis_data["wall_images"],
-                            st.session_state.current_layout_data,
-                        )
+                    st.session_state.generated_images_data = generate_images_with_controlnet(
+                        st.session_state.room_analysis_data["wall_images"],
+                        st.session_state.current_layout_data,
+                        st.session_state.user_prefs,  # Pass user_prefs to ControlNet for better prompting
                     )
                     overlay_labels_and_display(st.session_state.generated_images_data)
                 else:
@@ -926,11 +986,10 @@ if st.session_state.get("current_layout_data") and st.session_state.get(
                 llm_prompt, iteration_count=st.session_state.current_iteration
             )
             if st.session_state.current_layout_data:
-                st.session_state.generated_images_data = (
-                    generate_images_with_controlnet(
-                        st.session_state.room_analysis_data["wall_images"],
-                        st.session_state.current_layout_data,
-                    )
+                st.session_state.generated_images_data = generate_images_with_controlnet(
+                    st.session_state.room_analysis_data["wall_images"],
+                    st.session_state.current_layout_data,
+                    st.session_state.user_prefs,  # Pass user_prefs to ControlNet for better prompting
                 )
                 overlay_labels_and_display(st.session_state.generated_images_data)
             else:
