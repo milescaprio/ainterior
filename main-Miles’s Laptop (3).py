@@ -15,15 +15,10 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Suppress tokenizers warning
 # We'll load these only when needed to save memory and time if not used
 # and to manage dependencies better.
 # For local development, uncomment these and manage model downloads carefully.
-from ultralytics import YOLO
-from diffusers import (
-    StableDiffusionControlNetPipeline,
-    ControlNetModel,
-    UniPCMultistepScheduler,
-    EulerAncestralDiscreteScheduler,
-)
-from transformers import pipeline
-import torch
+# from ultralytics import YOLO
+# from diffusers import StableDiffusionControlNetPipeline, ControlNetModel, UniPCMultistepScheduler
+# from transformers import pipeline
+# import torch
 
 # --- Configuration ---
 # Your Gemini API Key (replace with your actual key)
@@ -134,7 +129,7 @@ MOCK_PRODUCT_DATABASE = {
 def load_yolo_model():
     """Loads the YOLOv8 object detection model."""
     try:
-        # from ultralytics import YOLO
+        from ultralytics import YOLO
 
         model = YOLO("yolov8n.pt")  # yolov8n is the nano model, good for local/CPU
         st.success("YOLOv8 model loaded successfully.")
@@ -150,13 +145,13 @@ def load_yolo_model():
 def load_diffusion_models():
     """Loads Stable Diffusion and ControlNet models."""
     try:
-        # from diffusers import (
-        #     StableDiffusionControlNetPipeline,
-        #     ControlNetModel,
-        #     UniPCMultistepScheduler,
-        # )
-        # from transformers import pipeline
-        # import torch
+        from diffusers import (
+            StableDiffusionControlNetPipeline,
+            ControlNetModel,
+            UniPCMultistepScheduler,
+        )
+        from transformers import pipeline
+        import torch
 
         # Load ControlNet model (trained on segmentation maps)
         controlnet = ControlNetModel.from_pretrained(
@@ -169,9 +164,7 @@ def load_diffusion_models():
             controlnet=controlnet,
             torch_dtype=torch.float16,
         )
-        pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(
-            pipe.scheduler.config
-        )
+        pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
 
         # Optimize for Apple Silicon (MPS) if available
         if torch.backends.mps.is_available():
@@ -541,6 +534,8 @@ def generate_images_with_controlnet(original_wall_images, proposed_layout):
         control_image = Image.new(
             "RGB", (width, height), color=(0, 0, 0)
         )  # Black background
+        control_image = pipe.image_processor.preprocess(control_image, return_tensors="pt").pixel_values
+        control_image = control_image.to(pipe.device)
         draw = ImageDraw.Draw(control_image)
         # Use a simple font for drawing on control image (if text needed)
         try:
@@ -662,24 +657,11 @@ def generate_images_with_controlnet(original_wall_images, proposed_layout):
         with st.spinner(f"Generating image for {wall_id} using ControlNet..."):
             try:
                 # Generate image
-                control_tensor = (
-                    pipe.image_processor.preprocess(control_image)[0]
-                    .unsqueeze(0)
-                    .to(pipe.device)
-                )
-                pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(
-                    pipe.scheduler.config
-                )
                 generated_image = pipe(
                     prompt_text,
-                    image=control_tensor,  # ControlNet uses this as conditioning
+                    image=control_image,  # ControlNet uses this as conditioning
                     num_inference_steps=20,  # Reduced steps for faster generation, can increase for quality
-                    guidance_scale=7.5,  # Often a good default
-                    negative_prompt=(
-                        "lowres, bad anatomy, bad hands, text, error, missing fingers, "
-                        "extra digit, fewer digits, cropped, worst quality, low quality, "
-                        "normal quality, jpeg artifacts, signature, watermark, username, blurry, noisy"
-                    ),
+                    # guidance_scale=7.5, # Often a good default
                     # generator=torch.Generator("cpu").manual_seed(0) # For reproducibility
                 ).images[0]
 
