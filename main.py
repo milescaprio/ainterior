@@ -669,35 +669,52 @@ def generate_images_with_controlnet(original_wall_images, proposed_layout, user_
         control_image_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
         control_image_data_uri = f"data:image/png;base64,{control_image_b64}"
 
+        # Display Image and Control Image
+        st.image(
+            original_image,
+            caption=f"Original Image for {wall_id}",
+            use_column_width=True,
+            output_format="PNG",
+        )
+        st.image(
+            control_image,
+            caption=f"Control Image for {wall_id} (Segmentation Map)",
+            use_column_width=True,
+            output_format="PNG",
+        )
+
         # Main prompt for ControlNet
         prompt_text = f"Photorealistic interior design, {proposed_layout['proposed_layout_description']}, {user_prefs['desired_style']} style, {user_prefs['color_palette']} color palette, {user_prefs['material_preferences']} materials, high detail, masterpiece."
         negative_prompt = "lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, noisy, deformed, ugly, disfigured"
 
         # Replicate API payload for ControlNet (using the 'seg' type)
-        # You can find the model ID for ControlNet-seg here:
-        # e.g., "lllyasviel/controlnet-v1-1-sd-v1-5-seg" or "jagilley/controlnet" and specify model_type="seg"
-        # The 'jagilley/controlnet' model is a general one that allows selecting model_type
-        # For simplicity, let's use 'jagilley/controlnet' and pass the 'seg' model_type
-        # Source: https://replicate.com/jagilley/controlnet
+        # Corrected: 'image' is the original image, 'control_image' is the segmentation map
         replicate_payload = {
-            "version": "jagilley/controlnet:a378a577c223c23e85e5d3155779c1628c65074b1bc532e2c2fafa66a3a41768",  # Specific ControlNet-seg version
+            "version": "jagilley/controlnet:8ebda4c70b3ea2a2bf86e44595afb562a2cdf85525c620f1671a78113c9f325b",  # Specific ControlNet-seg version
             "input": {
-                "image": control_image_data_uri,
+                "image": original_image_data_uri,  # Corrected: Original image as base for img2img
+                # "control_image": control_image_data_uri,  # Corrected: Segmentation map as control input
                 "prompt": prompt_text,
                 "model_type": "seg",  # Specify segmentation control
-                "num_outputs": 1,
-                "guidance_scale": 7.5,
-                "num_inference_steps": 25,  # Balance quality and speed
-                "resolution": GENERATION_RESOLUTION[
-                    0
-                ],  # Replicate expects single int for square
-                "negative_prompt": negative_prompt,
+                # "num_outputs": 1,
+                "num_samples": 1,
+                "scale": 7.5,
+                "ddim_steps": 25,  # Balance quality and speed
+                # "resolution": GENERATION_RESOLUTION[
+                # 0
+                #                ],  # Replicate expects single int for square
+                "n_prompt": negative_prompt,
                 "detect_resolution": GENERATION_RESOLUTION[
                     0
                 ],  # Resolution for preprocessor
-                "image_resolution": GENERATION_RESOLUTION[0],  # Output image resolution
+                "image_resolution": str(
+                    GENERATION_RESOLUTION[0]
+                ),  # Output image resolution
+                # "prompt_strength": 0.8,  # Controls how much the prompt influences the output vs. original image
             },
         }
+
+        print(json.dumps(replicate_payload, indent=4))
 
         with st.spinner(
             f"Sending request for {wall_id} to Replicate API and waiting for image generation..."
