@@ -183,12 +183,14 @@ def call_replicate_controlnet_api(payload):
             poll_response = requests.get(status_url, headers=headers)
             poll_response.raise_for_status()
             prediction_data = poll_response.json()
-            st.info(f"Replicate prediction status: {prediction_data.get('status')}...")
+            print(f"Replicate prediction status: {prediction_data.get('status')}...")
 
         if prediction_data.get("status") == "succeeded":
             output_url = prediction_data.get("output")
             if output_url and isinstance(output_url, list) and len(output_url) > 0:
-                return output_url[0]  # Replicate often returns a list of URLs
+                return output_url[
+                    1
+                ]  # Replicate often returns a list of URLs # Second image is the one we want
             else:
                 st.error(
                     f"Replicate prediction succeeded but no output URL found: {prediction_data}"
@@ -200,6 +202,14 @@ def call_replicate_controlnet_api(payload):
             )
             return None
 
+    except requests.exceptions.HTTPError as http_err:
+        # Handles HTTP error codes (like 422, 500, etc.)
+        st.error(f"HTTP error occurred: {http_err} - {response.status_code}")
+
+        # Print or log the response content for better debugging
+        st.error(f"Response content: {response.text}")
+
+        return None
     except requests.exceptions.RequestException as e:
         st.error(f"Network or API error communicating with Replicate: {e}")
         return None
@@ -670,22 +680,27 @@ def generate_images_with_controlnet(original_wall_images, proposed_layout, user_
         control_image_data_uri = f"data:image/png;base64,{control_image_b64}"
 
         # Display Image and Control Image
-        st.image(
-            original_image,
-            caption=f"Original Image for {wall_id}",
-            use_column_width=True,
-            output_format="PNG",
-        )
-        st.image(
-            control_image,
-            caption=f"Control Image for {wall_id} (Segmentation Map)",
-            use_column_width=True,
-            output_format="PNG",
-        )
+        # st.image(
+        #     original_image,
+        #     caption=f"Original Image for {wall_id}",
+        #     use_column_width=True,
+        #     output_format="PNG",
+        # )
+        # st.image(
+        #     control_image,
+        #     caption=f"Control Image for {wall_id} (Segmentation Map)",
+        #     use_column_width=True,
+        #     output_format="PNG",
+        # )
+
+        print(proposed_layout)
 
         # Main prompt for ControlNet
-        prompt_text = f"Photorealistic interior design, {proposed_layout['proposed_layout_description']}, {user_prefs['desired_style']} style, {user_prefs['color_palette']} color palette, {user_prefs['material_preferences']} materials, high detail, masterpiece."
-        negative_prompt = "lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, noisy, deformed, ugly, disfigured"
+        prompt_text = f"Photorealistic interior design, do not significantly change original image background. \
+            Only change objects. {proposed_layout['proposed_layout_description']}, \
+            {user_prefs['desired_style']} style, {user_prefs['color_palette']} color palette,\
+                {user_prefs['material_preferences']} materials, high detail, masterpiece."
+        negative_prompt = "Sigificant change. lowres, text, error, cropped, worst quality, low quality, normal quality, jpeg artifacts,  blurry, noisy, deformed, ugly, disfigured"
 
         # Replicate API payload for ControlNet (using the 'seg' type)
         # Corrected: 'image' is the original image, 'control_image' is the segmentation map
@@ -697,9 +712,9 @@ def generate_images_with_controlnet(original_wall_images, proposed_layout, user_
                 "prompt": prompt_text,
                 "model_type": "seg",  # Specify segmentation control
                 # "num_outputs": 1,
-                "num_samples": 1,
+                "num_samples": "1",
                 "scale": 7.5,
-                "ddim_steps": 25,  # Balance quality and speed
+                "ddim_steps": 20,  # Balance quality and speed
                 # "resolution": GENERATION_RESOLUTION[
                 # 0
                 #                ],  # Replicate expects single int for square
@@ -767,51 +782,6 @@ def overlay_labels_and_display(generated_images_data):
     for wall_id, data in generated_images_data.items():
         image = data["image"].copy()
         items = data["items"]
-
-        draw = ImageDraw.Draw(image)
-
-        # Adjust font size based on image height for better readability
-        # Assuming 512px height, font size 20-24 is good. Scale accordingly.
-        font_size = max(14, int(image.height / 25))  # Min 14, scales up
-        try:
-            font = ImageFont.truetype("arial.ttf", font_size)
-        except IOError:
-            font = ImageFont.load_default()
-
-        label_offset_y = font_size + 10  # Spacing between labels
-        current_y_pos = 20  # Starting Y position for labels
-
-        for item in items:
-            product_info = item.get("product_suggestion", {})
-
-            label_text = item["type"]
-            if (
-                product_info.get("name")
-                and product_info["name"] != f"Generic {item['type']}"
-            ):  # Don't show "Generic" in the label if it's explicitly generic
-                label_text += f"\n- {product_info['name']}"
-            if product_info.get("store") and product_info["store"] != "Generic":
-                label_text += f" ({product_info['store']})"
-
-            # Calculate text bounding box to draw background rectangle
-            try:
-                text_bbox = draw.textbbox((20, current_y_pos), label_text, font=font)
-                padding = 5
-                draw.rectangle(
-                    (
-                        text_bbox[0] - padding,
-                        text_bbox[1] - padding,
-                        text_bbox[2] + padding,
-                        text_bbox[3] + padding,
-                    ),
-                    fill=(0, 0, 0, 150),  # Semi-transparent black
-                )
-                draw.text(
-                    (20, current_y_pos), label_text, font=font, fill=(255, 255, 255)
-                )
-                current_y_pos += (text_bbox[3] - text_bbox[1]) + label_offset_y
-            except Exception as e:
-                st.warning(f"Could not draw text label for item '{item['type']}': {e}")
 
         st.image(
             image, caption=f"Suggested Design for {wall_id}", use_column_width=True
