@@ -693,13 +693,19 @@ def generate_images_with_controlnet(original_wall_images, proposed_layout, user_
         #     output_format="PNG",
         # )
 
-        print(proposed_layout)
+        print(wall_config)
+
+        from json_unpack import unpack_json_to_string
+
+        layout_data = unpack_json_to_string(wall_config)
 
         # Main prompt for ControlNet
         prompt_text = f"Photorealistic interior design, do not significantly change original image background. \
             Only change objects. {proposed_layout['proposed_layout_description']}, \
             {user_prefs['desired_style']} style, {user_prefs['color_palette']} color palette,\
-                {user_prefs['material_preferences']} materials, high detail, masterpiece."
+                {user_prefs['material_preferences']} materials, high detail, masterpiece.\
+                \
+                {layout_data}"
         negative_prompt = "Sigificant change. lowres, text, error, cropped, worst quality, low quality, normal quality, jpeg artifacts,  blurry, noisy, deformed, ugly, disfigured"
 
         # Replicate API payload for ControlNet (using the 'seg' type)
@@ -713,8 +719,8 @@ def generate_images_with_controlnet(original_wall_images, proposed_layout, user_
                 "model_type": "seg",  # Specify segmentation control
                 # "num_outputs": 1,
                 "num_samples": "1",
-                "scale": 7.5,
-                "ddim_steps": 20,  # Balance quality and speed
+                "scale": 15,
+                "ddim_steps": 30,  # Balance quality and speed
                 # "resolution": GENERATION_RESOLUTION[
                 # 0
                 #                ],  # Replicate expects single int for square
@@ -729,7 +735,7 @@ def generate_images_with_controlnet(original_wall_images, proposed_layout, user_
             },
         }
 
-        print(json.dumps(replicate_payload, indent=4))
+        # print(json.dumps(replicate_payload, indent=4))
 
         with st.spinner(
             f"Sending request for {wall_id} to Replicate API and waiting for image generation..."
@@ -784,7 +790,7 @@ def overlay_labels_and_display(generated_images_data):
         items = data["items"]
 
         st.image(
-            image, caption=f"Suggested Design for {wall_id}", use_column_width=True
+            image, caption=f"Suggested Design for {wall_id}", use_container_width=True
         )
         st.markdown(f"**Items for {wall_id}:**")
         for item in items:
@@ -886,7 +892,7 @@ user_prefs["color_palette"] = st.text_input(
 
 user_prefs["material_preferences"] = st.text_input(
     "Material Preferences (e.g., 'Wood', 'Metal', 'Fabric', 'Glass')",
-    value="natural wood and soft fabrics",
+    value="natural wood, metallic",
 )
 
 st.subheader("Where do you prefer to shop for products?")
@@ -907,7 +913,7 @@ user_prefs["store_preferences"] = st.multiselect(
 
 user_prefs["custom_prompt"] = st.text_area(
     "Any additional custom requests or ideas?",
-    value="Add more plants and create a cozy reading nook.",
+    value="Add more plants.",
 )
 
 st.session_state.user_prefs = user_prefs  # Store preferences in session state
