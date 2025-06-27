@@ -1,59 +1,86 @@
 import requests
 import base64
+import mimetypes
+import os
 
-
-# Load and encode image
-def encode_image(image_path):
-    with open(image_path, "rb") as f:
-        return f.read()
-
-
-# Define your parameters
-image_path = "bus.jpg"  # Replace with your local image file path
+# --- CONFIGURATION ---
+image_path = "bus.jpg"  # Path to your image
 from keys import REPLICATE_API_TOKEN as api_token  # Replace with your actual token
 
-# Prepare payload
-endpoint_url = "https://api.replicate.com/v1/predictions"
-headers = {"Authorization": f"Token {api_token}", "Content-Type": "application/json"}
+model_version = "jagilley/controlnet:8ebda4c70b3ea2a2bf86e44595afb562a2cdf85525c620f1671a78113c9f325b"  # Replace with actual model version
 
 
-# Upload the image to Replicate's file hosting
-def upload_to_replicate(image_path, api_token):
-    with open(image_path, "rb") as f:
-        response = requests.post(
-            "https://dreambooth-api-experimental.replicate.com/v1/upload",
-            headers={"Authorization": f"Token {api_token}"},
-            files={"file": f},
-        )
-    response.raise_for_status()
-    return response.json()["upload_url"], response.json()["serving_url"]
+# --- ENCODE IMAGE AS DATA URI ---
+def encode_image_to_data_uri(path):
+    mime_type, _ = mimetypes.guess_type(path)
+    if not mime_type:
+        raise ValueError("Could not determine MIME type.")
+    with open(path, "rb") as f:
+        encoded = base64.b64encode(f.read()).decode("utf-8")
+    return f"data:{mime_type};base64,{encoded}"
 
 
-# Upload the image and get the URL
-upload_url, image_url = upload_to_replicate(image_path, api_token)
+data_uri = encode_image_to_data_uri(image_path)
 
-# Modify these parameters based on jagilley/controlnet input schema
-input_data = {
-    "image": image_url,
-    "prompt": "A fantasy castle on a hill",
-    "controlnet_conditioning_scale": 1.0,
-    "num_inference_steps": 50,
-    "guidance_scale": 7.5,
-    # Add other params like "model", "controlnet_type", etc. as needed
+# --- PREPARE REQUEST ---
+endpoint = "https://api.replicate.com/v1/predictions"
+headers = {
+    "Authorization": f"Token {api_token}",
+    "Content-Type": "application/json",
 }
 
-# Send the request to Replicate
-response = requests.post(
-    endpoint_url,
-    headers=headers,
-    json={
-        "version": "jagilley/controlnet:8ebda4c70b3ea2a2bf86e44595afb562a2cdf85525c620f1671a78113c9f325b",  # Get the latest version from the model page
-        "input": input_data,
+payload = {
+    "version": model_version,
+    "input": {
+        "image": data_uri,
+        "prompt": "A futuristic cityscape",
+        "controlnet_conditioning_scale": 1.0,
+        "num_inference_steps": 50,
+        "guidance_scale": 7.5,
+        # Add other fields as needed
     },
-)
+}
 
-# Print result
+# --- SEND REQUEST ---
+response = requests.post(endpoint, headers=headers, json=payload)
+
+# --- HANDLE RESPONSE ---
 if response.ok:
-    print(response.json())
+    prediction = response.json()
+    print("Prediction ID:", prediction["id"])
+    print("Status:", prediction["status"])
 else:
-    print("Error:", response.text)
+    print("Error:", response.status_code, response.text)
+
+
+import time
+
+
+def wait_for_prediction(prediction_url, headers, timeout=60):
+    start_time = time.time()
+    while True:
+        response = requests.get(prediction_url, headers=headers)
+        if not response.ok:
+            raise RuntimeError(f"Error fetching prediction: {response.text}")
+
+        prediction = response.json()
+        status = prediction["status"]
+        print(f"Status: {status}")
+
+        if status == "succeeded":
+            print("✅ Prediction complete!")
+            print("Output:", prediction["output"])
+            return prediction["output"]
+        elif status == "failed":
+            raise RuntimeError(f"❌ Prediction failed: {prediction}")
+
+        if time.time() - start_time > timeout:
+            raise TimeoutError("Prediction took too long.")
+
+        time.sleep(2)  # Poll every 2 seconds
+
+
+# After POST request
+prediction = response.json()
+prediction_url = prediction["urls"]["get"]
+output = wait_for_prediction(prediction_url, headers)
